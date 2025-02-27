@@ -8,10 +8,10 @@ all: build
 
 build:
 	@echo "Building..."
-	@go build -o $(BINARY_NAME) ./cmd/weasel/main.go
+	@go build -o $(BINARY_NAME)
 
 run:
-	@go run ./cmd/weasel/main.go
+	@go run .
 
 clean:
 	@echo "Cleaning..."
