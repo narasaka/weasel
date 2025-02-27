@@ -18,6 +18,10 @@ make install
 
 ## usage
 
+> [!WARNING]\
+> due to the concurrent nature of the script when checking the links, you might
+> often get a 429 error (too many requests) when doing this.
+
 basic (only check links on that page)
 
 ```bash
