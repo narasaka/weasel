@@ -1,6 +1,7 @@
 # weasel
 
-small, fast tool to check for broken links in a webpage
+small, fast tool to check for broken links in a webpage. i made this because i
+needed it for a project. it might come in handy for you too.
 
 ## installation
 
