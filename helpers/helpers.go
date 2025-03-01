@@ -165,14 +165,12 @@ func traverse(targetURL *url.URL, recursive bool) {
 	var linksToCheck []*url.URL
 	for _, link := range links {
 		normalizedLink := normalizeURL(link)
-		if _, exists := statusMap.get(normalizedLink); !exists {
-			lURL, err := url.Parse(link)
-			if err != nil {
-				log.Printf("error parsing url: %v", err)
-				continue
-			}
-			linksToCheck = append(linksToCheck, lURL)
+		lURL, err := url.Parse(normalizedLink)
+		if err != nil {
+			log.Printf("error parsing url: %v", err)
+			continue
 		}
+		linksToCheck = append(linksToCheck, lURL)
 	}
 
 	var checkWG sync.WaitGroup
@@ -182,7 +180,7 @@ func traverse(targetURL *url.URL, recursive bool) {
 			defer checkWG.Done()
 			normalizedLink := normalizeURL(l.String())
 			if _, exists := statusMap.get(normalizedLink); exists {
-				fmt.Printf("%-70s [SEEN, SKIPPING]\n", normalizedTargetURL)
+				fmt.Printf("%-70s [SEEN, SKIPPING]\n", normalizedLink)
 				return
 			}
 			status := getLinkStatus(l, normalizedTargetURL)
