@@ -28,6 +28,24 @@ type StatusMap struct {
 	errors int
 }
 
+func (s *StatusMap) set(key string, link Link) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store[key] = link
+	if link.err != nil {
+		s.errors++
+	}
+}
+
+func (s *StatusMap) get(key string) (Link, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status, exists := s.store[key]
+	return status, exists
+}
+
+var statusMap StatusMap = StatusMap{store: make(map[string]Link)}
+
 func isSameDomain(baseURL, checkURL *url.URL) bool {
 	return baseURL.Hostname() == checkURL.Hostname()
 }
@@ -100,16 +118,14 @@ func normalizeURL(u string) string {
 }
 
 // dfs but on a webpage
-func traverse(targetURL *url.URL, recursive bool, statusMap *StatusMap) {
+func traverse(targetURL *url.URL, recursive bool) {
 	normalizedTargetURL := normalizeURL(targetURL.String())
 
 	// if target is seen, skip it
-	statusMap.mu.Lock()
-	if currentPage, exists := statusMap.store[normalizedTargetURL]; exists && currentPage.traversed {
+	if currentPage, exists := statusMap.get(normalizedTargetURL); exists && currentPage.traversed {
 		fmt.Printf("%-70s [SEEN, SKIPPING]\n", normalizedTargetURL)
 		return
 	}
-	statusMap.mu.Unlock()
 
 	// avoid 429 status codes
 	time.Sleep(100 * time.Millisecond)
@@ -128,12 +144,12 @@ func traverse(targetURL *url.URL, recursive bool, statusMap *StatusMap) {
 		return
 	}
 
-	statusMap.store[normalizedTargetURL] = Link{
+	statusMap.set(normalizedTargetURL, Link{
 		url:        targetURL,
 		statusCode: resp.StatusCode,
 		err:        nil,
 		traversed:  true,
-	}
+	})
 
 	// extract the links (<a> tags only for now) from the page
 	// and mark it as "seen"
@@ -166,29 +182,16 @@ func traverse(targetURL *url.URL, recursive bool, statusMap *StatusMap) {
 		go func(l *url.URL) {
 			defer checkWG.Done()
 			normalizedLink := normalizeURL(l.String())
-
-			// lock once for the entire "check-and-set" operation
-			statusMap.mu.Lock()
-			if _, exists := statusMap.store[normalizedLink]; exists {
-				statusMap.mu.Unlock()
-				fmt.Printf("%-70s [CACHED, SKIPPED]\n", normalizedLink)
+			if _, exists := statusMap.get(normalizedLink); exists {
+				fmt.Printf("%-70s [SEEN, SKIPPING]\n", normalizedLink)
 				return
 			}
-
-			// set a temporary value to mark this URL as "in progress"
-			statusMap.store[normalizedLink] = Link{url: l}
-			statusMap.mu.Unlock()
-
-			// get the status after releasing the lock
 			status := getLinkStatus(l, normalizedTargetURL)
-			statusMap.store[normalizedLink] = status
-
+			statusMap.set(normalizedLink, status)
 			if status.err != nil {
 				fmt.Printf("%-70s [ERROR: %v]\n", status.url, status.err)
-				statusMap.errors++
 			} else if status.statusCode != http.StatusOK {
 				fmt.Printf("%-70s [ERROR: Status %d]\n", status.url, status.statusCode)
-				statusMap.errors++
 			} else {
 				fmt.Printf("%-70s [OK]\n", status.url)
 			}
@@ -199,20 +202,19 @@ func traverse(targetURL *url.URL, recursive bool, statusMap *StatusMap) {
 	if recursive {
 		for _, link := range linksToCheck {
 			if isSameDomain(targetURL, link) {
-				traverse(link, recursive, statusMap)
+				traverse(link, recursive)
 			}
 		}
 	}
 }
 
 func Check(target string, recursive bool) {
-	var statusMap StatusMap = StatusMap{store: make(map[string]Link)}
 	targetURL, err := url.Parse(target)
 	if err != nil {
 		log.Fatalf("error parsing base url: %v\n", err)
 	}
 
-	traverse(targetURL, recursive, &statusMap)
+	traverse(targetURL, recursive)
 
 	if statusMap.errors > 0 {
 		fmt.Printf("\n=== Summary of All Problematic Links (%d) ===\n", statusMap.errors)
