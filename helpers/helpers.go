@@ -8,16 +8,24 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/net/html"
 )
 
-var seen map[string]bool
-
-type LinkStatus struct {
-	url        string
+type Link struct {
+	url        *url.URL
 	statusCode int
 	err        error
+	parent     string
+	traversed  bool
+}
+
+type StatusMap struct {
+	mu     sync.Mutex
+	store  map[string]Link
+	errors int
 }
 
 func isSameDomain(baseURL, checkURL *url.URL) bool {
@@ -64,41 +72,53 @@ func extractLinks(body io.Reader, baseURL *url.URL) ([]string, error) {
 	}
 }
 
-func getLinkStatus(link string) LinkStatus {
-	parsedURL, err := url.Parse(link)
+func getLinkStatus(link *url.URL, sourcePage string) Link {
+	if link.Scheme == "mailto" {
+		return Link{url: link, statusCode: http.StatusOK, err: nil, parent: sourcePage}
+	}
+	resp, err := http.Get(link.String())
 	if err != nil {
-		return LinkStatus{url: link, statusCode: 0, err: err}
+		return Link{url: link, statusCode: 0, err: err, parent: sourcePage}
 	}
-	if parsedURL.Scheme == "mailto" {
-		return LinkStatus{url: link, statusCode: http.StatusOK, err: nil}
+	if resp.StatusCode != http.StatusOK {
+		return Link{url: link, statusCode: resp.StatusCode, err: fmt.Errorf("HTTP %d", resp.StatusCode), parent: sourcePage}
 	}
-	resp, err := http.Get(link)
-	if err != nil {
-		return LinkStatus{url: link, statusCode: 0, err: err}
-	}
-	defer resp.Body.Close()
-	return LinkStatus{url: link, statusCode: resp.StatusCode, err: nil}
+	return Link{url: link, statusCode: resp.StatusCode, err: nil, parent: sourcePage}
 }
 
-// i want `example.com` to be treated the same as `example.com/`
+// i want `example.com` to be treated the same as `example.com/`.
+// trimming the leading and trailing spaces too because i've seen quite a few like: ` example.com/`
 func normalizeURL(u string) string {
-	if strings.HasSuffix(u, "/") {
-		return strings.TrimSuffix(u, "/")
+	if idx := strings.Index(u, "#"); idx != -1 {
+		u = u[:idx]
 	}
-	return u
+	if strings.HasSuffix(u, "/") {
+		normalized := strings.TrimSuffix(strings.TrimSpace(u), "/")
+		return normalized
+	}
+	return strings.TrimSpace(u)
 }
 
 // dfs but on a webpage
-func traverse(target string, baseURL *url.URL, recursive bool) {
-	normalizedTarget := normalizeURL(target)
-	if seen[normalizedTarget] {
+func traverse(targetURL *url.URL, recursive bool, statusMap *StatusMap) {
+	normalizedTargetURL := normalizeURL(targetURL.String())
+
+	// if target is seen, skip it
+	statusMap.mu.Lock()
+	if currentPage, exists := statusMap.store[normalizedTargetURL]; exists && currentPage.traversed {
+		fmt.Printf("%-70s [SEEN, SKIPPING]\n", normalizedTargetURL)
 		return
 	}
-	seen[normalizedTarget] = true
+	statusMap.mu.Unlock()
 
-	resp, err := http.Get(target)
+	// avoid 429 status codes
+	time.Sleep(100 * time.Millisecond)
+
+	fmt.Printf("\nChecking links on %s\n", normalizedTargetURL)
+
+	resp, err := http.Get(normalizedTargetURL)
 	if err != nil {
-		log.Printf("error fetching target url (%v): %v", target, err)
+		log.Printf("error fetching target url (%v): %v", normalizedTargetURL, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -108,66 +128,100 @@ func traverse(target string, baseURL *url.URL, recursive bool) {
 		return
 	}
 
-	links, err := extractLinks(resp.Body, baseURL)
+	statusMap.store[normalizedTargetURL] = Link{
+		url:        targetURL,
+		statusCode: resp.StatusCode,
+		err:        nil,
+		traversed:  true,
+	}
+
+	// extract the links (<a> tags only for now) from the page
+	// and mark it as "seen"
+	links, err := extractLinks(resp.Body, targetURL)
 	if err != nil {
 		log.Printf("error extracting links: %v\n", err)
 		return
 	}
 
-	var problematicLinks []LinkStatus
-	fmt.Printf("\nChecking links on %s\n", target)
-
-	results := make(chan LinkStatus, len(links))
-	for _, link := range links {
-		if !seen[link] {
-			go func(l string) {
-				results <- getLinkStatus(l)
-			}(link)
-		}
+	if len(links) == 0 {
+		fmt.Println("No links to check")
+		return
 	}
 
-	uniqueLinks := 0
+	// list of links to check only including those not already seen
+	var linksToCheck []*url.URL
 	for _, link := range links {
-		if !seen[link] {
-			uniqueLinks++
-			status := <-results
+		normalizedLink := normalizeURL(link)
+		lURL, err := url.Parse(normalizedLink)
+		if err != nil {
+			log.Printf("error parsing url: %v", err)
+			continue
+		}
+		linksToCheck = append(linksToCheck, lURL)
+	}
+
+	var checkWG sync.WaitGroup
+	for _, link := range linksToCheck {
+		checkWG.Add(1)
+		go func(l *url.URL) {
+			defer checkWG.Done()
+			normalizedLink := normalizeURL(l.String())
+
+			// lock once for the entire "check-and-set" operation
+			statusMap.mu.Lock()
+			if _, exists := statusMap.store[normalizedLink]; exists {
+				statusMap.mu.Unlock()
+				fmt.Printf("%-70s [CACHED, SKIPPED]\n", normalizedLink)
+				return
+			}
+
+			// set a temporary value to mark this URL as "in progress"
+			statusMap.store[normalizedLink] = Link{url: l}
+			statusMap.mu.Unlock()
+
+			// get the status after releasing the lock
+			status := getLinkStatus(l, normalizedTargetURL)
+			statusMap.store[normalizedLink] = status
+
 			if status.err != nil {
 				fmt.Printf("%-70s [ERROR: %v]\n", status.url, status.err)
-				problematicLinks = append(problematicLinks, status)
+				statusMap.errors++
 			} else if status.statusCode != http.StatusOK {
 				fmt.Printf("%-70s [ERROR: Status %d]\n", status.url, status.statusCode)
-				problematicLinks = append(problematicLinks, status)
+				statusMap.errors++
 			} else {
 				fmt.Printf("%-70s [OK]\n", status.url)
 			}
-
-			// handle recursion
-			if recursive {
-				linkURL, err := url.Parse(link)
-				if err == nil && isSameDomain(baseURL, linkURL) {
-					traverse(link, baseURL, recursive)
-				}
-			}
-		}
+		}(link)
 	}
+	checkWG.Wait()
 
-	if len(problematicLinks) > 0 {
-		fmt.Printf("\n=== Summary of Problematic Links for %s (%d) ===\n", target, len(problematicLinks))
-		for _, bad := range problematicLinks {
-			if bad.err != nil {
-				fmt.Printf("%-70s [ERROR: %v]\n", bad.url, bad.err)
-			} else {
-				fmt.Printf("%-70s [Status: %d]\n", bad.url, bad.statusCode)
+	if recursive {
+		for _, link := range linksToCheck {
+			if isSameDomain(targetURL, link) {
+				traverse(link, recursive, statusMap)
 			}
 		}
 	}
 }
 
 func Check(target string, recursive bool) {
-	seen = make(map[string]bool)
-	baseURL, err := url.Parse(target)
+	var statusMap StatusMap = StatusMap{store: make(map[string]Link)}
+	targetURL, err := url.Parse(target)
 	if err != nil {
 		log.Fatalf("error parsing base url: %v\n", err)
 	}
-	traverse(target, baseURL, recursive)
+
+	traverse(targetURL, recursive, &statusMap)
+
+	if statusMap.errors > 0 {
+		fmt.Printf("\n=== Summary of All Problematic Links (%d) ===\n", statusMap.errors)
+		for _, link := range statusMap.store {
+			if link.err != nil {
+				fmt.Printf("%-70s [ERROR: %v] (found on %s)\n", link.url, link.err, link.parent)
+			}
+		}
+	} else {
+		fmt.Println("\nNo broken links found!")
+	}
 }
