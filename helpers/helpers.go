@@ -28,8 +28,6 @@ type StatusMap struct {
 	errors int
 }
 
-var statusMap StatusMap = StatusMap{store: make(map[string]Link)}
-
 func isSameDomain(baseURL, checkURL *url.URL) bool {
 	return baseURL.Hostname() == checkURL.Hostname()
 }
@@ -102,7 +100,7 @@ func normalizeURL(u string) string {
 }
 
 // dfs but on a webpage
-func traverse(targetURL *url.URL, recursive bool) {
+func traverse(targetURL *url.URL, recursive bool, statusMap *StatusMap) {
 	normalizedTargetURL := normalizeURL(targetURL.String())
 
 	// if target is seen, skip it
@@ -173,7 +171,7 @@ func traverse(targetURL *url.URL, recursive bool) {
 			statusMap.mu.Lock()
 			if _, exists := statusMap.store[normalizedLink]; exists {
 				statusMap.mu.Unlock()
-				fmt.Printf("%-70s [CACHED]\n", normalizedLink)
+				fmt.Printf("%-70s [CACHED, SKIPPED]\n", normalizedLink)
 				return
 			}
 
@@ -201,19 +199,20 @@ func traverse(targetURL *url.URL, recursive bool) {
 	if recursive {
 		for _, link := range linksToCheck {
 			if isSameDomain(targetURL, link) {
-				traverse(link, recursive)
+				traverse(link, recursive, statusMap)
 			}
 		}
 	}
 }
 
 func Check(target string, recursive bool) {
+	var statusMap StatusMap = StatusMap{store: make(map[string]Link)}
 	targetURL, err := url.Parse(target)
 	if err != nil {
 		log.Fatalf("error parsing base url: %v\n", err)
 	}
 
-	traverse(targetURL, recursive)
+	traverse(targetURL, recursive, &statusMap)
 
 	if statusMap.errors > 0 {
 		fmt.Printf("\n=== Summary of All Problematic Links (%d) ===\n", statusMap.errors)
